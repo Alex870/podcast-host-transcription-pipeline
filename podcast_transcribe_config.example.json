@@ -1,0 +1,15 @@
+{
+  "default_source_dir": "D:/Speech_to_text/audio",
+  "hf_token": "",
+  "known_speakers_dir": "speaker_reference_samples",
+  "preferred_terms_file": "preferred_terms.txt",
+  "replacement_map_json": "preferred_replacements.json",
+  "host_profile_json": "host_profile.json",
+  "model": "large-v3",
+  "language": "en",
+  "compute_type": "auto",
+  "beam_size": 5,
+  "batch_size": 8,
+  "assume_dominant_speaker_is_host": true,
+  "host_threshold": 0.45
+}

@@ -1,0 +1,17 @@
+{
+  "speakers": [
+    {
+      "name": "HOST",
+      "is_host": true,
+      "files": [
+        "host_sample.wav"
+      ]
+    },
+    {
+      "name": "Guest_A",
+      "files": [
+        "guest_a_sample.wav"
+      ]
+    }
+  ]
+}
