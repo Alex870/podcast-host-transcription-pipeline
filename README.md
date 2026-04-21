@@ -2,6 +2,34 @@
 
 This project batch-processes podcast audio files into speaker-labeled transcripts, host-only extracts, JSON metadata, and review CSVs. The output is suitable for ingesting into a RAG pipeline for storing in a vector database.  It combines speech-to-text, speaker diarization, speaker-embedding matching, and terminology normalization so episodes can be transcribed in a way that is more useful for editorial review and downstream content workflows.
 
+
+## 🧠 System Overview
+
+```mermaid
+flowchart TD
+
+    A[Start] --> B[Setup + Initialization]
+    B --> C{Audio Files Found?}
+
+    C -->|No| Z[Exit]
+    C -->|Yes| D[Process Each File]
+
+    D --> E[Transcribe + Diarize]
+    E --> F[Identify Speakers + Host]
+    F --> G[Normalize + QA]
+    G --> H[Generate Outputs]
+
+    H --> I{Update Host Profile?}
+    I -->|Yes| J[Update Profile]
+    I -->|No| K[Skip]
+
+    J --> D
+    K --> D
+
+    D --> L[Write Batch Summary]
+    L --> M[End]
+```
+
 The repository is designed for shows where identifying the host matters. In addition to generic speaker diarization, it can:
 
 - label the host from a one-time reference clip

@@ -7,6 +7,59 @@ This document describes the architecture and processing flow of `podcast_transcr
 ## 🧠 System Flow Diagram
 
 ```mermaid
+flowchart TD
+
+    A[Start] --> 
+    B["Setup + Validation
+    ─ parse_args"] --> 
+    C["Load Configs + Models
+    ─ load_preferred_terms, load_replacement_map, get_device"] --> 
+    D["Scan Audio Files"]
+
+    D --> E{Files Found?}
+    E -->|No| Z[Exit]
+    E -->|Yes| F["Process Each File
+    ─ process_file"]
+
+    subgraph Processing
+        direction TB
+        F --> G["Transcription + Diarization
+        ─ transcribe_audio, diarize_audio"]
+        G --> H["Speaker Assignment
+        ─ assign_speakers_to_segments"]
+        H --> I["Host Detection + Matching
+        ─ choose_host_speaker, match_known_speakers"]
+        I --> J["Speaker Renaming
+        ─ rename_speakers"]
+        J --> K["Text Normalization
+        ─ coalesce_segments"]
+        K --> L["Quality Review + QA
+        ─ collect_review_rows"]
+    end
+
+    subgraph Outputs
+        direction TB
+        L --> O1["Write Transcripts
+        ─ write_text_transcript"]
+        L --> O2["Write JSON + Review CSV
+        ─ write_json_output, write_review_csv"]
+    end
+
+    O2 --> P{Update Host Profile?}
+    P -->|Yes| Q["Save Profile
+    ─ save_host_profile"]
+    P -->|No| R[Skip]
+
+    Q --> S["Build Episode Summary
+    ─ build_episode_summary_row"]
+    R --> S
+
+    S --> F
+
+    F --> T["Write Batch Summary CSV
+    ─ write_episode_summary_csv"]
+    T --> U[End]
+```mermaid
 flowchart LR
 
     %% --- SETUP ---
