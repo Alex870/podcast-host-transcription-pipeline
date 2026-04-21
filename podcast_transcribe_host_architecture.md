@@ -59,58 +59,6 @@ flowchart TD
     F --> T["Write Batch Summary CSV
     ─ write_episode_summary_csv"]
     T --> U[End]
-```mermaid
-flowchart LR
-
-    %% --- SETUP ---
-    A[Start] --> B[parse_args]
-    B --> C[Validate inputs]
-    C --> D[Load configs]
-    D --> E[get_device]
-    E --> F[Init Whisper]
-    F --> G[Init Diarization]
-    G --> H[Init Speaker Model]
-    H --> I[Load Known Speakers]
-    I --> J[Scan Audio Files]
-
-    J --> K{Files Found?}
-    K -->|No| Z[Exit]
-    K -->|Yes| L[Process File Loop]
-
-    %% --- PER FILE ---
-    subgraph Processing
-        L --> M[Transcribe]
-        M --> N[Diarize]
-        N --> O[Assign Speakers]
-        O --> P[Load Audio 16k]
-        P --> Q[Load Host Profile]
-        Q --> R[Detect Host]
-        R --> S[Match Known Speakers]
-        S --> T[Rename Speakers]
-        T --> U[Normalize Text]
-        U --> V[Collect QA Signals]
-    end
-
-    %% --- OUTPUTS ---
-    subgraph Outputs
-        V --> O1[Transcript All]
-        V --> O2[Transcript Host Only]
-        V --> O3[Review CSV]
-        V --> O4[JSON Output]
-    end
-
-    O4 --> W{Update Profile?}
-    W -->|Yes| X[Save Profile]
-    W -->|No| Y[Skip]
-
-    X --> AA[Build Episode Summary]
-    Y --> AA
-
-    AA --> L
-
-    %% --- FINAL ---
-    L --> AB[Write Summary CSV]
-    AB --> AC[End]
 ```
 
 ---
