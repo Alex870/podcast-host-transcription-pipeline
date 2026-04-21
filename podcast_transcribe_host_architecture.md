@@ -7,72 +7,57 @@ This document describes the architecture and processing flow of `podcast_transcr
 ## 🧠 System Flow Diagram
 
 ```mermaid
-flowchart TD
+flowchart LR
 
-    A[Start main()] --> B[parse_args()]
+    %% --- SETUP ---
+    A[Start] --> B[parse_args]
+    B --> C[Validate inputs]
+    C --> D[Load configs]
+    D --> E[get_device]
+    E --> F[Init Whisper]
+    F --> G[Init Diarization]
+    G --> H[Init Speaker Model]
+    H --> I[Load Known Speakers]
+    I --> J[Scan Audio Files]
 
-    B --> C[Validate input dir & HF token]
+    J --> K{Files Found?}
+    K -->|No| Z[Exit]
+    K -->|Yes| L[Process File Loop]
 
-    C --> D[Load preferred terms + replacement map]
-
-    D --> E[get_device()]
-    E --> F[Initialize WhisperModel]
-
-    F --> G[Load pyannote diarization Pipeline]
-    G --> H[Initialize SpeakerRecognition model]
-
-    H --> I[Load known speaker profiles]
-
-    I --> J[Scan input_dir for audio files]
-
-    J --> K{Any audio files?}
-    K -->|No| Z[Exit with error]
-    K -->|Yes| L[Loop: process_file(audio)]
-
-    %% --- PROCESS FILE ---
-    L --> M[transcribe_audio()]
-    M --> N[diarize_audio()]
-
-    N --> O[assign_speakers_to_segments()]
-
-    O --> P[load_audio_mono_16k()]
-    P --> Q[load_host_profile()]
-
-    Q --> R[choose_host_speaker()]
-
-    R --> S[match_known_speakers()]
-
-    S --> T{Known host override?}
-    T -->|Yes| U[Set host_speaker]
-    T -->|No| V[Keep detected host]
-
-    U --> W
-    V --> W
-
-    W[rename_speakers()] --> X[coalesce_segments()]
-
-    X --> Y[collect_review_rows()]
+    %% --- PER FILE ---
+    subgraph Processing
+        L --> M[Transcribe]
+        M --> N[Diarize]
+        N --> O[Assign Speakers]
+        O --> P[Load Audio 16k]
+        P --> Q[Load Host Profile]
+        Q --> R[Detect Host]
+        R --> S[Match Known Speakers]
+        S --> T[Rename Speakers]
+        T --> U[Normalize Text]
+        U --> V[Collect QA Signals]
+    end
 
     %% --- OUTPUTS ---
-    Y --> O1[write_text_transcript (all speakers)]
-    Y --> O2[write_text_transcript (host only)]
-    Y --> O3[write_review_csv()]
-    Y --> O4[write_json_output()]
+    subgraph Outputs
+        V --> O1[Transcript All]
+        V --> O2[Transcript Host Only]
+        V --> O3[Review CSV]
+        V --> O4[JSON Output]
+    end
 
-    O4 --> O5{Update host profile?}
-    O5 -->|Yes| O6[save_host_profile()]
-    O5 -->|No| O7[Skip]
+    O4 --> W{Update Profile?}
+    W -->|Yes| X[Save Profile]
+    W -->|No| Y[Skip]
 
-    O6 --> P1
-    O7 --> P1
+    X --> AA[Build Episode Summary]
+    Y --> AA
 
-    P1[build_episode_summary_row()] --> P2[Append to summary list]
-
-    P2 --> L
+    AA --> L
 
     %% --- FINAL ---
-    L --> Q1[write_episode_summary_csv()]
-    Q1 --> R1[End]
+    L --> AB[Write Summary CSV]
+    AB --> AC[End]
 ```
 
 ---
