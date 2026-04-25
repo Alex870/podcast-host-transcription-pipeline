@@ -1,4 +1,13 @@
-faster-whisper
-pyannote.audio
-speechbrain
-torchaudio
+# Windows + NVIDIA GPU stack for this project.
+# Uses CUDA 12.8 PyTorch wheels so `torch.cuda.is_available()` works in the
+# `podcast-transcribe` environment on this machine.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+
+numpy==2.2.6
+faster-whisper==1.2.1
+pyannote.audio==4.0.4
+speechbrain==1.1.0

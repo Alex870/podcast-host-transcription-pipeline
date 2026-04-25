@@ -23,6 +23,7 @@ This revision adds:
 - `host_profile.json`: auto-created persistent host voice profile
 - `speaker_reference_samples/speakers.json`: template config for named speaker reference clips
 - `podcast_transcribe_config.json`: launcher defaults for folders, model settings, and matching thresholds
+- generated outputs are written to an `output` folder beside the selected source folder
 
 ## Setup
 
@@ -50,12 +51,14 @@ Example:
 {
   "default_source_dir": "D:/Speech_to_text/audio",
   "hf_token": "",
+  "ffmpeg_bin_dir": "C:/ffmpeg/bin",
   "known_speakers_dir": "speaker_reference_samples",
   "preferred_terms_file": "preferred_terms.txt",
   "replacement_map_json": "preferred_replacements.json",
   "host_profile_json": "host_profile.json",
   "model": "large-v3",
   "language": "en",
+  "device": "auto",
   "compute_type": "auto",
   "beam_size": 5,
   "batch_size": 8,
@@ -68,12 +71,14 @@ Parameters:
 
 - `default_source_dir`: default starting folder for the source-audio selection dialog
 - `hf_token`: Hugging Face token used for pyannote diarization model access
+- `ffmpeg_bin_dir`: directory containing the FFmpeg DLLs used by the Windows runtime
 - `known_speakers_dir`: directory containing `speakers.json` and named voice samples
 - `preferred_terms_file`: glossary file used to bias transcription
 - `replacement_map_json`: post-correction map for common mistranscriptions
 - `host_profile_json`: persistent learned host voice profile
 - `model`: `faster-whisper` model name
 - `language`: language code for transcription
+- `device`: runtime device such as `auto`, `cpu`, or `cuda`
 - `compute_type`: `faster-whisper` compute type such as `auto`, `float16`, `int8`, etc.
 - `beam_size`: beam size for decoding
 - `batch_size`: transcription batch size
@@ -91,7 +96,19 @@ Token handling:
 - The PowerShell launcher first looks for `HF_TOKEN` in the environment
 - If `HF_TOKEN` is not set, it uses `hf_token` from `podcast_transcribe_config.json`
 - If no token is available, the launcher stops and shows a message before running Python
-- If the token is invalid or lacks access to `pyannote/speaker-diarization-community-1`, the Python helper raises a clearer authentication error and the launcher shows a follow-up warning
+- If the token is invalid or lacks access to `pyannote/speaker-diarization-community-1`, the Python helper raises a clearer authentication error
+
+FFmpeg handling:
+
+- The launcher uses `ffmpeg_bin_dir` from config when available
+- If `ffmpeg_bin_dir` is missing or invalid, the launcher prompts for the FFmpeg `bin` directory
+- The path is only written back to config after the import checks succeed
+
+Progress feedback:
+
+- The console shows batch progress such as `file 1 of 3`
+- Transcription shows an in-place progress bar with elapsed time and estimated total time for the current file
+- Diarization shows `pyannote.audio` progress bars for segmentation, speaker counting, embeddings, and discrete diarization
 
 ## Best results
 
@@ -181,7 +198,11 @@ This is better than relying only on “dominant speaker = host”, which can dri
 - `*_host_only.txt`
 - `*_review.csv`
 - `*_speaker_transcript.json`
-- `_episode_review_summary.csv`
+
+Batch output location:
+
+- The launcher writes all generated files to an `output` folder beside the selected source folder
+- `_episode_review_summary.csv` is written in that same `output` folder
 
 ## Practical note
 

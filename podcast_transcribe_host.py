@@ -1,19 +1,96 @@
 import argparse
 import csv
+import inspect
 import json
 import os
 import re
+import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+def configure_ffmpeg_dll_directory():
+    ffmpeg_bin_dir = os.getenv("PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR") or os.getenv("FFMPEG_BIN_DIR")
+    if os.name != "nt" or not ffmpeg_bin_dir or not hasattr(os, "add_dll_directory"):
+        return
+
+    if os.path.isdir(ffmpeg_bin_dir):
+        os.add_dll_directory(ffmpeg_bin_dir)
+
+
+configure_ffmpeg_dll_directory()
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchcodec is not installed correctly so built-in audio decoding will fail.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    module=r"pyannote\.audio\.core\.io",
+    category=Warning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*TensorFloat-32 \(TF32\) has been disabled.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchaudio\._backend\.list_audio_backends has been deprecated.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*implementation will be changed to use torchaudio\.load_with_torchcodec.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Requested Pretrainer collection using symlinks on Windows.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*std\(\): degrees of freedom is <= 0.*",
+    category=UserWarning,
+)
 
 import numpy as np
 import torch
 import torchaudio
+import huggingface_hub
 from faster_whisper import WhisperModel
+
+
+def _patch_huggingface_hub_auth_compat():
+    signature = inspect.signature(huggingface_hub.hf_hub_download)
+    if "use_auth_token" in signature.parameters:
+        return
+
+    original_hf_hub_download = huggingface_hub.hf_hub_download
+
+    def compat_hf_hub_download(*args, use_auth_token=None, **kwargs):
+        if use_auth_token is not None and "token" not in kwargs:
+            kwargs["token"] = use_auth_token
+        return original_hf_hub_download(*args, **kwargs)
+
+    huggingface_hub.hf_hub_download = compat_hf_hub_download
+
+    try:
+        import huggingface_hub.file_download as file_download
+
+        file_download.hf_hub_download = compat_hf_hub_download
+    except Exception:
+        pass
+
+
+_patch_huggingface_hub_auth_compat()
+
+import pyannote.audio as pyannote_audio
 from pyannote.audio import Pipeline
-from speechbrain.inference.speaker import SpeakerRecognition
+from pyannote.audio.pipelines.utils.hook import ProgressHook
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
@@ -46,7 +123,9 @@ def parse_args():
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name.")
     parser.add_argument("--language", default="en", help="Language code.")
     parser.add_argument("--device", default="auto", help="Whisper device: auto, cpu, or cuda.")
-    parser.add_argument("--compute-type", default="auto", help="faster-whisper compute type.")
+    # "auto" can pick CPU paths or unsupported configs. 5070 Ti → float16 is correct and fastest
+    # parser.add_argument("--compute-type", default="auto", help="faster-whisper compute type.")
+    parser.add_argument("--compute-type", default="float16", help="faster-whisper compute type.")
     parser.add_argument("--beam-size", type=int, default=5, help="Beam size for decoding.")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for faster-whisper.")
     parser.add_argument("--hf-token", default=os.getenv("HF_TOKEN"), help="Hugging Face token for pyannote pipeline.")
@@ -118,6 +197,12 @@ def get_device(device_arg: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def normalize_runtime_device(device: str) -> str:
+    if device == "cuda":
+        return "cuda:0"
+    return device
+
+
 def format_timestamp(seconds: Optional[float]) -> str:
     if seconds is None:
         return "unknown"
@@ -135,6 +220,16 @@ def load_preferred_terms(path: Optional[str]) -> List[str]:
     if not file_path.exists():
         return []
     return [line.strip() for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def load_speaker_verifier(model_id: str, device: str):
+    from speechbrain.inference.speaker import SpeakerRecognition
+
+    return SpeakerRecognition.from_hparams(
+        source=model_id,
+        savedir="pretrained_speaker_model",
+        run_opts={"device": normalize_runtime_device(device)},
+    )
 
 
 def build_prompt_bias(terms: List[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -270,20 +365,55 @@ def transcribe_audio(
     initial_prompt: Optional[str],
     hotwords: Optional[str],
 ) -> Tuple[List[SegmentItem], Dict[str, object]]:
-    segments, info = model.transcribe(
-        audio_path,
-        language=language,
-        beam_size=beam_size,
-        batch_size=batch_size,
-        vad_filter=True,
-        word_timestamps=True,
-        condition_on_previous_text=True,
-        initial_prompt=initial_prompt,
-        hotwords=hotwords,
-    )
+    transcribe_kwargs = {
+        "language": language,
+        "beam_size": beam_size,
+        "vad_filter": True,
+        "word_timestamps": True,
+        "condition_on_previous_text": True,
+        "initial_prompt": initial_prompt,
+        "hotwords": hotwords,
+    }
+
+    transcribe_signature = inspect.signature(model.transcribe)
+    if "batch_size" in transcribe_signature.parameters:
+        transcribe_kwargs["batch_size"] = batch_size
+
+    segments, info = model.transcribe(audio_path, **transcribe_kwargs)
 
     results = []
+    total_duration = getattr(info, "duration", None)
+    transcription_started = time.perf_counter()
+    last_progress_update = 0.0
     for idx, segment in enumerate(segments):
+        if total_duration and total_duration > 0:
+            progress_ratio = min(1.0, float(segment.end) / float(total_duration))
+            progress = min(100, int(progress_ratio * 100))
+            elapsed_seconds = time.perf_counter() - transcription_started
+            should_print_progress = (
+                last_progress_update == 0.0
+                or elapsed_seconds - last_progress_update >= 5.0
+                or progress >= 100
+            )
+            if should_print_progress:
+                estimated_total_seconds = (
+                    elapsed_seconds / progress_ratio if progress_ratio > 0 else None
+                )
+                bar_width = 40
+                filled = min(bar_width, int((progress / 100) * bar_width))
+                bar = "━" * filled + " " * (bar_width - filled)
+                eta_text = (
+                    format_timestamp(estimated_total_seconds)
+                    if estimated_total_seconds is not None
+                    else "unknown"
+                )
+                print(
+                    f"\r  transcription         {bar} {progress:3d}% "
+                    f"{format_timestamp(elapsed_seconds)} / {eta_text}",
+                    end="",
+                    flush=True,
+                )
+                last_progress_update = elapsed_seconds
         words = []
         if segment.words:
             for word in segment.words:
@@ -308,6 +438,8 @@ def transcribe_audio(
                 words=words,
             )
         )
+    if total_duration and total_duration > 0:
+        print()
 
     info_payload = {
         "language": getattr(info, "language", None),
@@ -323,9 +455,22 @@ def diarize_audio(pipeline: Pipeline, audio_path: str, num_speakers: Optional[in
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
 
-    diarization = pipeline(audio_path, **kwargs)
+    waveform, sample_rate = torchaudio.load(audio_path)
+    diarization_input = {
+        "waveform": waveform,
+        "sample_rate": sample_rate,
+    }
+
+    with ProgressHook() as hook:
+        diarization = pipeline(diarization_input, hook=hook, **kwargs)
+
+    diarization_annotation = (
+        diarization.speaker_diarization
+        if hasattr(diarization, "speaker_diarization")
+        else diarization
+    )
     turns = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
+    for turn, _, speaker in diarization_annotation.itertracks(yield_label=True):
         turns.append(
             {
                 "start": float(turn.start),
@@ -334,6 +479,48 @@ def diarize_audio(pipeline: Pipeline, audio_path: str, num_speakers: Optional[in
             }
         )
     return turns
+
+
+def parse_version_major(version_text: str) -> int:
+    match = re.match(r"^(\d+)", version_text or "")
+    return int(match.group(1)) if match else 0
+
+
+def resolve_compatible_diarization_model(model_id: str) -> Tuple[str, Optional[str]]:
+    pyannote_version = getattr(pyannote_audio, "__version__", "")
+    pyannote_major = parse_version_major(pyannote_version)
+
+    if model_id == "pyannote/speaker-diarization-community-1" and pyannote_major and pyannote_major < 4:
+        return (
+            "pyannote/speaker-diarization-3.1",
+            (
+                f"pyannote.audio {pyannote_version} is installed, so switching diarization model from "
+                "'pyannote/speaker-diarization-community-1' to the compatible legacy pipeline "
+                "'pyannote/speaker-diarization-3.1'."
+            ),
+        )
+
+    return model_id, None
+
+
+def load_diarization_pipeline(model_id: str, hf_token: str) -> Tuple[Pipeline, str]:
+    resolved_model_id, compatibility_note = resolve_compatible_diarization_model(model_id)
+    if compatibility_note:
+        print(compatibility_note)
+
+    signature = inspect.signature(Pipeline.from_pretrained)
+    parameters = signature.parameters
+
+    if "token" in parameters:
+        return Pipeline.from_pretrained(resolved_model_id, token=hf_token), resolved_model_id
+
+    if "use_auth_token" in parameters:
+        return Pipeline.from_pretrained(resolved_model_id, use_auth_token=hf_token), resolved_model_id
+
+    raise RuntimeError(
+        "Unsupported pyannote.audio installation: Pipeline.from_pretrained accepts neither "
+        "'token' nor 'use_auth_token'."
+    )
 
 
 def overlap_seconds(start_a: float, end_a: float, start_b: float, end_b: float) -> float:
@@ -409,7 +596,7 @@ def build_speaker_audio_samples(
     return merged
 
 
-def compute_embedding(verifier: SpeakerRecognition, waveform_16k: torch.Tensor) -> np.ndarray:
+def compute_embedding(verifier: Any, waveform_16k: torch.Tensor) -> np.ndarray:
     signal = waveform_16k.unsqueeze(0)
     with torch.no_grad():
         embedding = verifier.encode_batch(signal)
@@ -421,7 +608,7 @@ def compute_embedding(verifier: SpeakerRecognition, waveform_16k: torch.Tensor) 
 
 
 def load_known_speaker_profiles(
-    verifier: SpeakerRecognition,
+    verifier: Any,
     known_speakers_dir: Optional[str],
 ) -> Dict[str, Dict[str, object]]:
     config_entries = load_known_speakers_config(known_speakers_dir)
@@ -465,7 +652,7 @@ def load_known_speaker_profiles(
 
 
 def choose_host_speaker(
-    verifier: SpeakerRecognition,
+    verifier: Any,
     waveform_16k: torch.Tensor,
     diarized_turns: List[Dict[str, object]],
     host_reference_path: Optional[str],
@@ -850,10 +1037,16 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
             writer.writerow(row)
 
 
-def write_text_transcript(path: Path, segments: List[SegmentItem], host_only: bool = False):
+def write_text_transcript(
+    path: Path,
+    segments: List[SegmentItem],
+    host_only: bool = False,
+    host_labels: Optional[set[str]] = None,
+):
     lines = []
+    host_labels = host_labels or {"HOST"}
     for segment in segments:
-        if host_only and segment.speaker != "HOST":
+        if host_only and segment.speaker not in host_labels:
             continue
         label = segment.speaker or "UNKNOWN"
         lines.append(f"[{format_timestamp(segment.start)}][{label}] {segment.text}")
@@ -902,7 +1095,7 @@ def process_file(
     output_dir: Path,
     whisper_model: WhisperModel,
     diarization_pipeline: Pipeline,
-    verifier: SpeakerRecognition,
+    verifier: Any,
     language: str,
     beam_size: int,
     batch_size: int,
@@ -921,6 +1114,8 @@ def process_file(
     print(f"Processing {audio_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print("  stage: transcription")
+    transcription_started = time.perf_counter()
     segments, info_payload = transcribe_audio(
         model=whisper_model,
         audio_path=str(audio_path),
@@ -930,10 +1125,22 @@ def process_file(
         initial_prompt=initial_prompt,
         hotwords=hotwords,
     )
+    print(
+        f"  transcription complete: {len(segments)} raw segments "
+        f"in {time.perf_counter() - transcription_started:.1f}s"
+    )
 
+    print("  stage: diarization")
+    diarization_started = time.perf_counter()
     diarized_turns = diarize_audio(diarization_pipeline, str(audio_path), num_speakers=num_speakers)
     assign_speakers_to_segments(segments, diarized_turns)
+    print(
+        f"  diarization complete: {len(diarized_turns)} turns "
+        f"in {time.perf_counter() - diarization_started:.1f}s"
+    )
 
+    print("  stage: speaker matching")
+    matching_started = time.perf_counter()
     waveform_16k = load_audio_mono_16k(str(audio_path))
     existing_profile = load_host_profile(host_profile_path)
     host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
@@ -978,10 +1185,23 @@ def process_file(
         similarity_scores=similarity_scores,
         speaker_mapping=speaker_mapping,
     )
+    print(
+        f"  speaker matching complete: {len(speaker_mapping)} labeled speakers, "
+        f"{len(review_rows)} review rows in {time.perf_counter() - matching_started:.1f}s"
+    )
 
+    print("  stage: writing outputs")
+    writing_started = time.perf_counter()
     base_name = audio_path.stem
+    resolved_host_label = speaker_mapping.get(host_speaker, "HOST") if host_speaker else "HOST"
+    host_output_labels = {resolved_host_label, "HOST"}
     write_text_transcript(output_dir / f"{base_name}_speaker_transcript.txt", normalized_segments, host_only=False)
-    write_text_transcript(output_dir / f"{base_name}_host_only.txt", normalized_segments, host_only=True)
+    write_text_transcript(
+        output_dir / f"{base_name}_host_only.txt",
+        normalized_segments,
+        host_only=True,
+        host_labels=host_output_labels,
+    )
     write_review_csv(output_dir / f"{base_name}_review.csv", review_rows)
     write_json_output(
         output_dir / f"{base_name}_speaker_transcript.json",
@@ -997,6 +1217,7 @@ def process_file(
 
     if updated_profile is not None and host_speaker is not None:
         save_host_profile(host_profile_path, updated_profile, str(audio_path))
+    print(f"  writing complete in {time.perf_counter() - writing_started:.1f}s")
 
     total_segments = len(normalized_segments)
     host_segments = sum(1 for segment in normalized_segments if segment.speaker == "HOST")
@@ -1039,22 +1260,38 @@ def main():
     whisper_model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
 
     try:
-        diarization_pipeline = Pipeline.from_pretrained(args.diarization_model, token=args.hf_token)
+        diarization_pipeline, resolved_diarization_model = load_diarization_pipeline(
+            args.diarization_model, args.hf_token
+        )
+    except TypeError as exc:
+        raise RuntimeError(
+            "Failed to load the pyannote diarization model because this environment's pyannote.audio API "
+            "does not match the loader call. The code now supports both 'token' and 'use_auth_token', so "
+            "this likely indicates an unexpected pyannote.audio version or conflicting installation. "
+            f"Original error: {exc}"
+        ) from exc
     except Exception as exc:
         message = str(exc).lower()
-        if any(token_hint in message for token_hint in ["401", "403", "unauthorized", "forbidden", "access denied", "token"]):
+        if any(token_hint in message for token_hint in ["401", "403", "unauthorized", "forbidden", "access denied"]):
             raise RuntimeError(
-                "Failed to load the pyannote diarization model because the Hugging Face token appears to be missing, "
-                "invalid, or does not have access to the required model. Confirm the token value and make sure you have "
-                "accepted access terms for pyannote/speaker-diarization-community-1."
+                "Failed to load the pyannote diarization model because Hugging Face rejected the token or model access. "
+                "Confirm the token value and make sure you have accepted access terms for "
+                "pyannote/speaker-diarization-community-1."
+            ) from exc
+        if "plda" in message and "unexpected keyword argument" in message:
+            raise RuntimeError(
+                "Failed to load the diarization pipeline because the installed pyannote.audio version is not "
+                "compatible with 'pyannote/speaker-diarization-community-1'. Upgrade to pyannote.audio 4.x for "
+                "community-1, or use the legacy 'pyannote/speaker-diarization-3.1' pipeline with pyannote.audio 3.x."
             ) from exc
         raise RuntimeError(
             f"Failed to load diarization model '{args.diarization_model}'. Original error: {exc}"
         ) from exc
+    print(f"Using diarization model: {resolved_diarization_model}")
     if device == "cuda":
-        diarization_pipeline.to(torch.device("cuda"))
+        diarization_pipeline.to(torch.device(normalize_runtime_device(device)))
 
-    verifier = SpeakerRecognition.from_hparams(source=args.speaker_model, savedir="pretrained_speaker_model")
+    verifier = load_speaker_verifier(args.speaker_model, device)
     known_speaker_profiles = load_known_speaker_profiles(
         verifier=verifier,
         known_speakers_dir=args.known_speakers_dir,
@@ -1070,7 +1307,20 @@ def main():
         raise RuntimeError(f"No supported audio files found in {input_dir}")
 
     episode_summary_rows = []
-    for audio_path in audio_files:
+    total_files = len(audio_files)
+    batch_started = time.perf_counter()
+    for index, audio_path in enumerate(audio_files, start=1):
+        elapsed = time.perf_counter() - batch_started
+        average_seconds = elapsed / (index - 1) if index > 1 else None
+        remaining_files = total_files - index + 1
+        eta_seconds = average_seconds * remaining_files if average_seconds is not None else None
+        if eta_seconds is not None:
+            print(
+                f"Batch progress: file {index} of {total_files} "
+                f"(estimated remaining {format_timestamp(eta_seconds)})"
+            )
+        else:
+            print(f"Batch progress: file {index} of {total_files}")
         episode_summary_rows.append(
             process_file(
             audio_path=audio_path,

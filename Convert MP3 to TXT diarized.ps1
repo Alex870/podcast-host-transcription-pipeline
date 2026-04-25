@@ -1,5 +1,7 @@
 $PythonScript = Join-Path $PSScriptRoot "podcast_transcribe_host.py"
 $ConfigPath = Join-Path $PSScriptRoot "podcast_transcribe_config.json"
+$ConfigExamplePath = Join-Path $PSScriptRoot "podcast_transcribe_config.example.json"
+$EnvPath = Join-Path $PSScriptRoot ".env"
 
 function Resolve-ConfigPathValue {
     param(
@@ -17,55 +19,212 @@ function Resolve-ConfigPathValue {
     return Join-Path $PSScriptRoot $Value
 }
 
+function Set-ConfigValue {
+    param(
+        [psobject]$ConfigObject,
+        [string]$Name,
+        $Value
+    )
+
+    if ($null -eq $ConfigObject.PSObject.Properties[$Name]) {
+        $ConfigObject | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    } else {
+        $ConfigObject.$Name = $Value
+    }
+}
+
+function Save-Config {
+    param(
+        [psobject]$ConfigObject
+    )
+
+    $ConfigObject | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+}
+
+function Load-DotEnvFile {
+    param(
+        [string]$Path
+    )
+
+    $values = @{}
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $values
+    }
+
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#")) {
+            continue
+        }
+
+        $parts = $trimmed -split "=", 2
+        if ($parts.Count -ne 2) {
+            continue
+        }
+
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if (
+            ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+            ($value.StartsWith("'") -and $value.EndsWith("'"))
+        ) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            $values[$key] = $value
+        }
+    }
+
+    return $values
+}
+
+function Resolve-HfToken {
+    param(
+        [psobject]$ConfigObject,
+        [string]$EnvFilePath,
+        [string]$ConfigFilePath
+    )
+
+    $attempts = New-Object System.Collections.Generic.List[string]
+    $resolvedToken = $null
+    $resolvedSource = $null
+
+    $processToken = $env:HF_TOKEN
+    if ([string]::IsNullOrWhiteSpace($processToken)) {
+        $attempts.Add("Process environment HF_TOKEN: not found")
+    } else {
+        $attempts.Add("Process environment HF_TOKEN: found")
+        $resolvedToken = $processToken
+        $resolvedSource = "process environment variable HF_TOKEN"
+    }
+
+    $dotenvValues = Load-DotEnvFile -Path $EnvFilePath
+    if (Test-Path -LiteralPath $EnvFilePath) {
+        if ($dotenvValues.ContainsKey("HF_TOKEN") -and -not [string]::IsNullOrWhiteSpace($dotenvValues["HF_TOKEN"])) {
+            $attempts.Add(".env file ($EnvFilePath): HF_TOKEN found")
+            if (-not $resolvedToken) {
+                $resolvedToken = $dotenvValues["HF_TOKEN"]
+                $resolvedSource = ".env file at $EnvFilePath"
+                $env:HF_TOKEN = $resolvedToken
+            }
+        } else {
+            $attempts.Add(".env file ($EnvFilePath): file found, HF_TOKEN missing")
+        }
+    } else {
+        $attempts.Add(".env file ($EnvFilePath): file not found")
+    }
+
+    $configToken = if ($ConfigObject.hf_token) { [string]$ConfigObject.hf_token } else { $null }
+    if ([string]::IsNullOrWhiteSpace($configToken)) {
+        $attempts.Add("Config file ($ConfigFilePath): hf_token not set")
+    } else {
+        $attempts.Add("Config file ($ConfigFilePath): hf_token found")
+        if (-not $resolvedToken) {
+            $resolvedToken = $configToken
+            $resolvedSource = "config file at $ConfigFilePath"
+            $env:HF_TOKEN = $resolvedToken
+        }
+    }
+
+    return [pscustomobject]@{
+        Token   = $resolvedToken
+        Source  = $resolvedSource
+        Attempts = @($attempts)
+    }
+}
+
+function Test-HuggingFaceToken {
+    param(
+        [string]$Token
+    )
+
+    try {
+        $headers = @{ Authorization = "Bearer $Token" }
+        $response = Invoke-RestMethod -Uri "https://huggingface.co/api/whoami-v2" -Headers $headers -Method Get -TimeoutSec 15
+        return [pscustomobject]@{
+            IsValid = $true
+            Detail  = if ($response.name) { "Authenticated as $($response.name)." } else { "Token accepted by Hugging Face." }
+        }
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+
+        if ($statusCode -eq 401 -or $statusCode -eq 403) {
+            return [pscustomobject]@{
+                IsValid = $false
+                Detail  = "Hugging Face rejected the token with HTTP $statusCode."
+            }
+        }
+
+        return [pscustomobject]@{
+            IsValid = $false
+            Detail  = "Unable to validate the Hugging Face token early. $($_.Exception.Message)"
+        }
+    }
+}
+
+function Select-Folder {
+    param(
+        [string]$Description,
+        [string]$InitialFolder
+    )
+
+    Write-Host "Folder selection dialog open..."
+    $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{
+        RootFolder  = "MyComputer"
+        Description = $Description
+    }
+
+    if ($InitialFolder -and (Test-Path -LiteralPath $InitialFolder)) {
+        $folderBrowser.SelectedPath = $InitialFolder
+    }
+
+    $null = $folderBrowser.ShowDialog()
+    return $folderBrowser.SelectedPath
+}
+
+function Test-PythonDependencies {
+    $dependencyCheck = @"
+import importlib
+import sys
+
+required = ['numpy', 'torch', 'torchaudio', 'faster_whisper', 'pyannote.audio', 'speechbrain']
+missing = []
+resolved = []
+errors = []
+
+for name in required:
+    try:
+        module = importlib.import_module(name)
+        path = getattr(module, '__file__', '<built-in>')
+        resolved.append(f'{name}={path}')
+    except Exception as exc:
+        missing.append(name)
+        errors.append(f'{name}:{type(exc).__name__}:{exc}')
+
+print('RESOLVED:' + '|'.join(resolved))
+if errors:
+    print('ERRORS:' + '|'.join(errors))
+if missing:
+    print('MISSING:' + '|'.join(missing))
+    sys.exit(1)
+"@
+
+    & python -c $dependencyCheck
+    return $LASTEXITCODE
+}
+
 $Config = $null
 if (Test-Path -LiteralPath $ConfigPath) {
     $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-}
-
-$PreferredTermsFile = Resolve-ConfigPathValue $(if ($Config.preferred_terms_file) { $Config.preferred_terms_file } else { "preferred_terms.txt" })
-$ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json) { $Config.replacement_map_json } else { "preferred_replacements.json" })
-$HostProfileJson = Resolve-ConfigPathValue $(if ($Config.host_profile_json) { $Config.host_profile_json } else { "host_profile.json" })
-$KnownSpeakersDir = Resolve-ConfigPathValue $(if ($Config.known_speakers_dir) { $Config.known_speakers_dir } else { "speaker_reference_samples" })
-
-$WhisperModel = if ($Config.model) { $Config.model } else { "large-v3" }
-$Language = if ($Config.language) { $Config.language } else { "en" }
-$ComputeType = if ($Config.compute_type) { $Config.compute_type } else { "auto" }
-$BeamSize = if ($null -ne $Config.beam_size) { [int]$Config.beam_size } else { 5 }
-$BatchSize = if ($null -ne $Config.batch_size) { [int]$Config.batch_size } else { 8 }
-$AssumeDominantSpeakerIsHost = if ($null -ne $Config.assume_dominant_speaker_is_host) { [bool]$Config.assume_dominant_speaker_is_host } else { $true }
-$HostThreshold = if ($null -ne $Config.host_threshold) { [double]$Config.host_threshold } else { 0.45 }
-$DefaultSourceFolder = Resolve-ConfigPathValue $(if ($Config.default_source_dir) { $Config.default_source_dir } else { $null })
-$ConfiguredHfToken = if ($Config.hf_token) { [string]$Config.hf_token } else { $null }
-
-Write-Host "Folder selection dialog open..."
-Add-Type -AssemblyName System.Windows.Forms
-
-$FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{
-    RootFolder  = "MyComputer"
-    Description = "Select a source folder for podcast audio files."
-}
-
-if ($DefaultSourceFolder -and (Test-Path -LiteralPath $DefaultSourceFolder)) {
-    $FolderBrowser.SelectedPath = $DefaultSourceFolder
-}
-
-$null = $FolderBrowser.ShowDialog()
-
-if ([string]::IsNullOrWhiteSpace($FolderBrowser.SelectedPath)) {
-    Write-Error "Error: folder not selected. Exiting."
-    pause
-    exit
-}
-
-$OpenFileDialog = New-Object System.Windows.Forms.OpenFileDialog -Property @{
-    Title = "Optional: choose a clean host voice sample"
-    Filter = "Audio Files|*.mp3;*.wav;*.m4a;*.flac;*.ogg|All Files|*.*"
-    Multiselect = $false
-}
-
-$HostReference = $null
-if ($OpenFileDialog.ShowDialog() -eq "OK" -and -not [string]::IsNullOrWhiteSpace($OpenFileDialog.FileName)) {
-    $HostReference = $OpenFileDialog.FileName
+} elseif (Test-Path -LiteralPath $ConfigExamplePath) {
+    $Config = Get-Content -LiteralPath $ConfigExamplePath -Raw | ConvertFrom-Json
+} else {
+    $Config = [pscustomobject]@{}
 }
 
 if (-not (Test-Path -LiteralPath $PythonScript)) {
@@ -74,38 +233,180 @@ if (-not (Test-Path -LiteralPath $PythonScript)) {
     exit
 }
 
-if (-not $env:HF_TOKEN -and -not [string]::IsNullOrWhiteSpace($ConfiguredHfToken)) {
-    $env:HF_TOKEN = $ConfiguredHfToken
+Add-Type -AssemblyName System.Windows.Forms
+
+$tokenResolution = Resolve-HfToken -ConfigObject $Config -EnvFilePath $EnvPath -ConfigFilePath $ConfigPath
+Write-Host "HF_TOKEN lookup details:"
+foreach ($attempt in $tokenResolution.Attempts) {
+    Write-Host " - $attempt"
 }
 
-if (-not $env:HF_TOKEN) {
+if (-not $tokenResolution.Token) {
     Write-Host ""
-    Write-Host "HF_TOKEN is not set."
-    Write-Host "Set hf_token in podcast_transcribe_config.json or set HF_TOKEN in the environment before running this script."
-    Write-Host "It is required for pyannote speaker diarization and speaker attribution."
+    Write-Error "HF_TOKEN could not be resolved. The loader checked the process environment, .env, and podcast_transcribe_config.json."
     pause
     exit
 }
 
-conda activate whisper
+Write-Host "Using HF_TOKEN from $($tokenResolution.Source)"
+$tokenValidation = Test-HuggingFaceToken -Token $tokenResolution.Token
+if (-not $tokenValidation.IsValid) {
+    Write-Host ""
+    Write-Error $tokenValidation.Detail
+    pause
+    exit
+}
+Write-Host $tokenValidation.Detail
+
+$ConfiguredSourceFolder = Resolve-ConfigPathValue $(if ($Config.default_source_dir) { $Config.default_source_dir } else { $null })
+$SourceFolder = $null
+if ($ConfiguredSourceFolder -and (Test-Path -LiteralPath $ConfiguredSourceFolder)) {
+    $SourceFolder = $ConfiguredSourceFolder
+    Write-Host "Using configured source folder: $SourceFolder"
+} else {
+    if ($ConfiguredSourceFolder) {
+        Write-Host "Configured source folder was not found: $ConfiguredSourceFolder"
+    } else {
+        Write-Host "No source folder configured."
+    }
+
+    $SelectedFolder = Select-Folder -Description "Select a source folder for podcast audio files." -InitialFolder $null
+    if ([string]::IsNullOrWhiteSpace($SelectedFolder)) {
+        Write-Error "Error: folder not selected. Exiting."
+        pause
+        exit
+    }
+
+    $SourceFolder = $SelectedFolder
+    Set-ConfigValue -ConfigObject $Config -Name "default_source_dir" -Value $SourceFolder
+    Save-Config -ConfigObject $Config
+    Write-Host "Saved default_source_dir to $ConfigPath"
+}
+
+$ConfiguredFfmpegBinDir = Resolve-ConfigPathValue $(if ($Config.ffmpeg_bin_dir) { $Config.ffmpeg_bin_dir } else { $null })
+$FfmpegBinDir = $null
+$PersistFfmpegBinDir = $false
+if ($ConfiguredFfmpegBinDir -and (Test-Path -LiteralPath $ConfiguredFfmpegBinDir)) {
+    $FfmpegBinDir = $ConfiguredFfmpegBinDir
+    Write-Host "Using configured ffmpeg bin directory: $FfmpegBinDir"
+} else {
+    if ($ConfiguredFfmpegBinDir) {
+        Write-Host "Configured ffmpeg bin directory was not found: $ConfiguredFfmpegBinDir"
+    } else {
+        Write-Host "No ffmpeg bin directory configured."
+    }
+
+    $InitialFfmpegFolder = if (Test-Path -LiteralPath "C:\ffmpeg\bin") { "C:\ffmpeg\bin" } else { $null }
+    $SelectedFfmpegBinDir = Select-Folder -Description "Select the ffmpeg bin directory (the folder containing ffmpeg DLLs)." -InitialFolder $InitialFfmpegFolder
+    if ([string]::IsNullOrWhiteSpace($SelectedFfmpegBinDir)) {
+        Write-Error "Error: ffmpeg bin directory not selected. Exiting."
+        pause
+        exit
+    }
+
+    $FfmpegBinDir = $SelectedFfmpegBinDir
+    $PersistFfmpegBinDir = $true
+}
+
+$DefaultKnownSpeakersDir = Join-Path $PSScriptRoot "speaker_reference_samples"
+$ConfiguredKnownSpeakersDir = Resolve-ConfigPathValue $(if ($Config.known_speakers_dir) { $Config.known_speakers_dir } else { $null })
+$KnownSpeakersDir = $null
+
+if ($ConfiguredKnownSpeakersDir -and (Test-Path -LiteralPath $ConfiguredKnownSpeakersDir)) {
+    $KnownSpeakersDir = $ConfiguredKnownSpeakersDir
+    Write-Host "Using configured speaker reference samples directory: $KnownSpeakersDir"
+} elseif (Test-Path -LiteralPath $DefaultKnownSpeakersDir) {
+    $KnownSpeakersDir = $DefaultKnownSpeakersDir
+    if ($ConfiguredKnownSpeakersDir) {
+        Write-Host "Configured speaker reference samples directory was not found: $ConfiguredKnownSpeakersDir"
+    }
+    Write-Host "Using default speaker reference samples directory: $KnownSpeakersDir"
+    if ($Config.known_speakers_dir -ne "speaker_reference_samples") {
+        Set-ConfigValue -ConfigObject $Config -Name "known_speakers_dir" -Value "speaker_reference_samples"
+        Save-Config -ConfigObject $Config
+        Write-Host "Saved known_speakers_dir to $ConfigPath"
+    }
+} else {
+    Write-Host "No speaker reference samples directory is configured."
+    $SelectedKnownSpeakersDir = Select-Folder -Description "Select the folder containing speaker reference samples." -InitialFolder $null
+    if (-not [string]::IsNullOrWhiteSpace($SelectedKnownSpeakersDir)) {
+        $KnownSpeakersDir = $SelectedKnownSpeakersDir
+        Set-ConfigValue -ConfigObject $Config -Name "known_speakers_dir" -Value $KnownSpeakersDir
+        Save-Config -ConfigObject $Config
+        Write-Host "Saved known_speakers_dir to $ConfigPath"
+    }
+}
+
+$PreferredTermsFile = Resolve-ConfigPathValue $(if ($Config.preferred_terms_file) { $Config.preferred_terms_file } else { "preferred_terms.txt" })
+$ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json) { $Config.replacement_map_json } else { "preferred_replacements.json" })
+$HostProfileJson = Resolve-ConfigPathValue $(if ($Config.host_profile_json) { $Config.host_profile_json } else { "host_profile.json" })
+$ConfiguredHostReference = Resolve-ConfigPathValue $(if ($Config.host_reference) { $Config.host_reference } else { $null })
+
+$WhisperModel = if ($Config.model) { $Config.model } else { "large-v3" }
+$Language = if ($Config.language) { $Config.language } else { "en" }
+$Device = if ($Config.device) { $Config.device } else { "auto" }
+$ComputeType = if ($Config.compute_type) { $Config.compute_type } else { "auto" }
+$BeamSize = if ($null -ne $Config.beam_size) { [int]$Config.beam_size } else { 5 }
+$BatchSize = if ($null -ne $Config.batch_size) { [int]$Config.batch_size } else { 8 }
+$AssumeDominantSpeakerIsHost = if ($null -ne $Config.assume_dominant_speaker_is_host) { [bool]$Config.assume_dominant_speaker_is_host } else { $true }
+$HostThreshold = if ($null -ne $Config.host_threshold) { [double]$Config.host_threshold } else { 0.45 }
+
+conda activate podcast-transcribe
+$env:PYTHONNOUSERSITE = "1"
+$env:PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR = $FfmpegBinDir
 cls
 
-$SourceFolder = $FolderBrowser.SelectedPath
+$dependencyCheckOutput = Test-PythonDependencies 2>&1
+if ($LASTEXITCODE -ne 0) {
+    $resolvedModules = @($dependencyCheckOutput | Where-Object { $_ -like "RESOLVED:*" })
+    $dependencyErrors = @($dependencyCheckOutput | Where-Object { $_ -like "ERRORS:*" })
+    $missingModules = @($dependencyCheckOutput | Where-Object { $_ -like "MISSING:*" })
+
+    Write-Host ""
+    if ($resolvedModules) {
+        Write-Host ($resolvedModules -replace '^RESOLVED:', 'Resolved modules: ')
+    }
+    if ($dependencyErrors) {
+        Write-Host ($dependencyErrors -replace '^ERRORS:', 'Import errors: ')
+    }
+    Write-Error "The active 'podcast-transcribe' environment is missing required Python packages: $($missingModules -replace '^MISSING:', '')"
+    Write-Host "Install the missing packages into the conda environment and rerun the launcher."
+    Write-Host "Suggested command: pip install -r podcast_transcribe_requirements.txt"
+    pause
+    exit
+}
+
+if ($PersistFfmpegBinDir -and $FfmpegBinDir) {
+    Set-ConfigValue -ConfigObject $Config -Name "ffmpeg_bin_dir" -Value $FfmpegBinDir
+    Save-Config -ConfigObject $Config
+    Write-Host "Saved ffmpeg_bin_dir to $ConfigPath"
+}
+
 $startTime = Get-Date
 
 Write-Host "Processing Folder: $SourceFolder"
-if ($HostReference) {
-    Write-Host "Host reference sample: $HostReference"
+Write-Host "Configured model: $WhisperModel"
+Write-Host "Configured device: $Device"
+Write-Host "PYTHONNOUSERSITE: $env:PYTHONNOUSERSITE"
+Write-Host "ffmpeg bin directory: $FfmpegBinDir"
+$OutputRoot = Split-Path -Path $SourceFolder -Parent
+$OutputFolder = Join-Path $OutputRoot "output"
+Write-Host "Output folder: $OutputFolder"
+if ($ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
+    Write-Host "Using configured host reference sample: $ConfiguredHostReference"
+} elseif ($KnownSpeakersDir -and (Test-Path -LiteralPath (Join-Path $KnownSpeakersDir "speakers.json"))) {
+    Write-Host "Host reference sample: using speaker reference samples from $KnownSpeakersDir"
 } else {
-    Write-Host "Host reference sample: none selected"
+    Write-Host "Host reference sample: not configured"
 }
 
 $args = @(
     $PythonScript
     "--input-dir", $SourceFolder
-    "--output-dir", $SourceFolder
+    "--output-dir", $OutputFolder
     "--model", $WhisperModel
     "--language", $Language
+    "--device", $Device
     "--compute-type", $ComputeType
     "--beam-size", "$BeamSize"
     "--batch-size", "$BatchSize"
@@ -113,18 +414,25 @@ $args = @(
     "--replacement-map-json", $ReplacementMapJson
     "--host-profile-json", $HostProfileJson
     "--host-threshold", "$HostThreshold"
+    "--hf-token", $tokenResolution.Token
 )
 
 if ($AssumeDominantSpeakerIsHost) {
     $args += "--assume-dominant-speaker-is-host"
 }
 
-if ($HostReference) {
-    $args += @("--host-reference", $HostReference)
+if ($ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
+    $args += @("--host-reference", $ConfiguredHostReference)
 }
 
-if (Test-Path -LiteralPath (Join-Path $KnownSpeakersDir "speakers.json")) {
-    $args += @("--known-speakers-dir", $KnownSpeakersDir)
+if ($KnownSpeakersDir) {
+    $KnownSpeakersConfigPath = Join-Path $KnownSpeakersDir "speakers.json"
+    if (Test-Path -LiteralPath $KnownSpeakersConfigPath) {
+        $args += @("--known-speakers-dir", $KnownSpeakersDir)
+        Write-Host "Using speaker reference config: $KnownSpeakersConfigPath"
+    } else {
+        Write-Host "Speaker reference directory is configured, but speakers.json was not found at $KnownSpeakersConfigPath"
+    }
 }
 
 & python @args
@@ -133,10 +441,6 @@ $pythonExitCode = $LASTEXITCODE
 if ($pythonExitCode -ne 0) {
     Write-Host ""
     Write-Host "The transcription pipeline exited with an error."
-    Write-Host "If the error mentions authentication, access denied, unauthorized, or pyannote model loading,"
-    Write-Host "your Hugging Face token is likely missing, invalid, or has not accepted the pyannote model access terms."
-    Write-Host "Update hf_token in podcast_transcribe_config.json or HF_TOKEN in the environment and confirm access to"
-    Write-Host "pyannote/speaker-diarization-community-1 on Hugging Face."
 }
 
 $elapsedTime = (Get-Date) - $startTime
