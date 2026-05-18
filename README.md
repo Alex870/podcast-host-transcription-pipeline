@@ -35,6 +35,7 @@ For each supported audio file in an input folder, the pipeline:
 - `Run Podcast Transcribe.ps1`: root bootstrap launcher that lets you choose between environment validation and the main processing pipeline
 - `scripts/Convert-AudioToDiarizedText.ps1`: Windows PowerShell launcher that auto-loads `.env`, validates the Hugging Face token early, and uses persisted config values before prompting
 - `scripts/Debug-PodcastTranscribeEnvironment.ps1`: focused environment and dependency diagnostic script
+- `scripts/Migrate-LegacyPodcastTranscribeState.ps1`: migrates runtime config, glossary files, speaker-reference material, processed-state files, and output artifacts from a legacy working directory
 - `examples/podcast_transcribe_config.example.json`: example runtime configuration file
 - `examples/preferred_terms.txt`: optional glossary for domain-specific spellings
 - `examples/preferred_replacements.json`: optional post-processing replacements for common mistranscriptions
@@ -54,6 +55,7 @@ It gives you a simple choice:
 
 1. Run environment validation
 2. Run the transcription pipeline
+3. Migrate settings and state from a legacy directory
 
 ## Technical Details
 
@@ -315,6 +317,16 @@ Then update `podcast_transcribe_config.json` so the pipeline points at your work
   "replacement_map_json": "preferred_replacements.json"
 }
 ```
+
+If you already have an older working directory with transcripts, speaker samples, or local config, you can migrate it after setup through:
+
+```powershell
+.\Run Podcast Transcribe.ps1
+```
+
+Choose `3` to launch the migration assistant. It opens a folder picker for the legacy directory, warns once if existing target files or folders will be overwritten or merged into, and then copies forward the runtime config, glossary files, speaker-reference material, processed-file state, host profile, pretrained speaker model directory, and output contents while printing a pass/warn checklist for anything it could not find.
+
+If the legacy `default_source_dir` points to a folder inside the selected legacy directory, the migration assistant also copies that source tree into the new repository at the same relative path and updates the migrated config so `default_source_dir` points at the copied location.
 
 Use them like this:
 
