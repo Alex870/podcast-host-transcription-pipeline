@@ -32,7 +32,7 @@ For each supported audio file in an input folder, the pipeline:
 
 - `src/podcast_transcribe/`: importable Python package for the transcription framework
 - `podcast_transcribe_host.py`: thin compatibility wrapper for `python podcast_transcribe_host.py`
-- `Run Podcast Transcribe.ps1`: root bootstrap launcher that lets you choose between environment validation and the main processing pipeline
+- `Run Podcast Transcribe.ps1`: root bootstrap launcher for environment validation, the main processing pipeline, and legacy-state migration
 - `scripts/Convert-AudioToDiarizedText.ps1`: Windows PowerShell launcher that auto-loads `.env`, validates the Hugging Face token early, and uses persisted config values before prompting
 - `scripts/Debug-PodcastTranscribeEnvironment.ps1`: focused environment and dependency diagnostic script
 - `scripts/Migrate-LegacyPodcastTranscribeState.ps1`: migrates runtime config, glossary files, speaker-reference material, processed-state files, and output artifacts from a legacy working directory
@@ -179,7 +179,7 @@ cd Podcast-Host-Transcription-Pipeline
 
 ### 2. Create a Python environment
 
-The PowerShell launcher currently runs `conda activate podcast-transcribe`, so the path of least resistance is to create an environment with that name.
+The PowerShell launchers currently run `conda activate podcast-transcribe`, so the path of least resistance is to create an environment with that name.
 
 Example:
 
@@ -189,7 +189,7 @@ conda activate podcast-transcribe
 pip install -r podcast_transcribe_requirements.txt
 ```
 
-If you prefer a different environment name or a plain virtual environment, you will need to update `scripts/Convert-AudioToDiarizedText.ps1` and adjust the `conda activate podcast-transcribe` command accordingly.
+If you prefer a different environment name or a plain virtual environment, update the launchers under `scripts\` accordingly, especially `scripts/Convert-AudioToDiarizedText.ps1` and `scripts/Debug-PodcastTranscribeEnvironment.ps1`.
 
 ### 3. Get a Hugging Face token
 
@@ -205,7 +205,7 @@ First:
 Then provide the token in one of these ways:
 
 - Set `HF_TOKEN` in your shell environment
-- or place `HF_TOKEN` in a local `.env` file beside the scripts
+- or place `HF_TOKEN` in a local `.env` file in the project root
 - or place it in `podcast_transcribe_config.json`
 
 Example for the current shell:
@@ -386,10 +386,12 @@ The script ends with an overall `PASS` or `FAIL` summary and pauses so you can r
 This is the easiest way to run the project on Windows.
 
 ```powershell
-.\scripts\Convert-AudioToDiarizedText.ps1
+.\Run Podcast Transcribe.ps1
 ```
 
-The launcher will:
+Choose `2` for the main transcription pipeline.
+
+The bootstrap and underlying launcher will:
 
 - auto-load `HF_TOKEN` from the process environment, `.env`, or `podcast_transcribe_config.json`
 - validate the Hugging Face token near startup and print exactly where it tried to read it from
@@ -398,6 +400,12 @@ The launcher will:
 - use `known_speakers_dir` from config, or auto-discover the local `speaker_reference_samples` folder, before prompting
 - only open a folder picker when required information is missing
 - immediately write prompted values back into `podcast_transcribe_config.json`
+
+If you want to bypass the menu and call the lower-level runner directly, use:
+
+```powershell
+.\scripts\Convert-AudioToDiarizedText.ps1
+```
 - write all generated outputs to an `output` folder beside the selected source folder
 - show batch progress, transcription progress, and diarization progress in the console
 - pass the effective settings into `podcast_transcribe_host.py`
