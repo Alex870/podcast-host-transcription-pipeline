@@ -41,12 +41,23 @@ function Set-ConfigValue {
     }
 }
 
+function Write-Utf8NoBomFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 function Save-Config {
     param(
         [psobject]$ConfigObject
     )
 
-    $ConfigObject | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    $json = $ConfigObject | ConvertTo-Json -Depth 10
+    Write-Utf8NoBomFile -Path $ConfigPath -Content ($json + [Environment]::NewLine)
 }
 
 function Select-WhisperModel {

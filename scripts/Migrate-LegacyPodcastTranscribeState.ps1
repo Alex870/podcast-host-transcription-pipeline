@@ -179,6 +179,16 @@ function Copy-DirectoryWithProgress {
     Add-Result "PASS" $Label ("Copied {0} file(s) from {1} into {2}" -f $files.Count, $SourcePath, $TargetPath)
 }
 
+function Write-Utf8NoBomFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 function Resolve-LegacyCandidate {
     param(
         [string]$LegacyRoot,
@@ -239,51 +249,139 @@ function Convert-ToProjectRelativePath {
     return [System.Uri]::UnescapeDataString($relative).Replace('/', '\')
 }
 
-function Resolve-LegacySourceDirectory {
+function Test-PathTypeMatch {
     param(
-        [psobject]$LegacyConfig,
-        [string]$LegacyRoot,
-        [string]$CurrentProjectRoot
+        [string]$Path,
+        [string]$PathType
     )
 
-    if ($null -eq $LegacyConfig -or -not $LegacyConfig.default_source_dir) {
-        return $null
+    switch ($PathType) {
+        "File" { return (Test-Path -LiteralPath $Path -PathType Leaf) }
+        "Directory" { return (Test-Path -LiteralPath $Path -PathType Container) }
+        default { return (Test-Path -LiteralPath $Path) }
     }
+}
 
-    $configuredSource = [string]$LegacyConfig.default_source_dir
-    $directCandidate = if ([System.IO.Path]::IsPathRooted($configuredSource)) {
-        $configuredSource
-    } else {
-        Join-Path $LegacyRoot $configuredSource
+function Get-ConfigValueOrDefault {
+    param(
+        [psobject]$ConfigObject,
+        [string]$Key,
+        [string]$DefaultValue
+    )
+
+    if ($null -ne $ConfigObject -and $ConfigObject.PSObject.Properties[$Key]) {
+        $value = [string]$ConfigObject.$Key
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
     }
+    return $DefaultValue
+}
 
-    if ((Test-Path -LiteralPath $directCandidate -PathType Container) -and (Test-PathContainedBy -Path $directCandidate -Container $LegacyRoot)) {
+function Resolve-ConfiguredPath {
+    param(
+        [string]$ConfiguredPath,
+        [string]$LegacyRoot,
+        [string]$CurrentProjectRoot,
+        [string]$PathType
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConfiguredPath)) {
         return [pscustomobject]@{
-            SourcePath    = $directCandidate
-            RelativePath  = Convert-ToProjectRelativePath -Path $directCandidate -BasePath $LegacyRoot
-            Resolution    = "legacy_config_path"
-            ConfigValue   = $configuredSource
+            ConfigValue   = $ConfiguredPath
+            RelativePath  = $null
+            PortablePath  = $null
+            LegacyPath    = $null
+            Resolution    = "empty"
+            ShouldRemap   = $false
         }
     }
 
-    if ([System.IO.Path]::IsPathRooted($configuredSource) -and (Test-PathContainedBy -Path $configuredSource -Container $CurrentProjectRoot)) {
-        $relativePath = Convert-ToProjectRelativePath -Path $configuredSource -BasePath $CurrentProjectRoot
-        $legacyRelativeCandidate = Join-Path $LegacyRoot $relativePath
-        if (Test-Path -LiteralPath $legacyRelativeCandidate -PathType Container) {
+    $normalizedConfigured = $ConfiguredPath.Replace('/', '\')
+    if ([System.IO.Path]::IsPathRooted($normalizedConfigured)) {
+        if (Test-PathContainedBy -Path $normalizedConfigured -Container $LegacyRoot) {
+            $relativePath = Convert-ToProjectRelativePath -Path $normalizedConfigured -BasePath $LegacyRoot
             return [pscustomobject]@{
-                SourcePath    = $legacyRelativeCandidate
+                ConfigValue   = $ConfiguredPath
                 RelativePath  = $relativePath
-                Resolution    = "current_repo_relative_fallback"
-                ConfigValue   = $configuredSource
+                PortablePath  = $relativePath.Replace('\', '/')
+                LegacyPath    = if (Test-PathTypeMatch -Path $normalizedConfigured -PathType $PathType) { $normalizedConfigured } else { $null }
+                Resolution    = "legacy_absolute"
+                ShouldRemap   = $true
             }
         }
+
+        if (Test-PathContainedBy -Path $normalizedConfigured -Container $CurrentProjectRoot) {
+            $relativePath = Convert-ToProjectRelativePath -Path $normalizedConfigured -BasePath $CurrentProjectRoot
+            $legacyCandidate = Join-Path $LegacyRoot $relativePath
+            return [pscustomobject]@{
+                ConfigValue   = $ConfiguredPath
+                RelativePath  = $relativePath
+                PortablePath  = $relativePath.Replace('\', '/')
+                LegacyPath    = if (Test-PathTypeMatch -Path $legacyCandidate -PathType $PathType) { $legacyCandidate } else { $null }
+                Resolution    = if (Test-PathTypeMatch -Path $legacyCandidate -PathType $PathType) { "current_repo_relative_fallback" } else { "current_repo_relative_only" }
+                ShouldRemap   = $true
+            }
+        }
+
+        return [pscustomobject]@{
+            ConfigValue   = $ConfiguredPath
+            RelativePath  = $null
+            PortablePath  = $null
+            LegacyPath    = $null
+            Resolution    = "external_absolute"
+            ShouldRemap   = $false
+        }
     }
 
+    $legacyCandidate = Join-Path $LegacyRoot $normalizedConfigured
     return [pscustomobject]@{
-        SourcePath   = $null
-        RelativePath = $null
-        Resolution   = "not_found"
-        ConfigValue  = $configuredSource
+        ConfigValue   = $ConfiguredPath
+        RelativePath  = $normalizedConfigured
+        PortablePath  = $normalizedConfigured.Replace('\', '/')
+        LegacyPath    = if (Test-PathTypeMatch -Path $legacyCandidate -PathType $PathType) { $legacyCandidate } else { $null }
+        Resolution    = if (Test-PathTypeMatch -Path $legacyCandidate -PathType $PathType) { "legacy_relative" } else { "relative_missing" }
+        ShouldRemap   = $false
+    }
+}
+
+function Set-ConfigValue {
+    param(
+        [psobject]$ConfigObject,
+        [string]$Key,
+        [string]$Value
+    )
+
+    if ($ConfigObject.PSObject.Properties[$Key]) {
+        $ConfigObject.$Key = $Value
+    } else {
+        $ConfigObject | Add-Member -NotePropertyName $Key -NotePropertyValue $Value
+    }
+}
+
+function Update-MigratedConfigPaths {
+    param(
+        [string]$ConfigPath,
+        [System.Collections.Generic.List[object]]$PathMappings
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $configObject = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        foreach ($mapping in $PathMappings) {
+            if (-not $mapping.ShouldRemap -or [string]::IsNullOrWhiteSpace($mapping.NewValue)) {
+                continue
+            }
+            Set-ConfigValue -ConfigObject $configObject -Key $mapping.Key -Value $mapping.NewValue
+            Add-Result "PASS" ("Config path remap: {0}" -f $mapping.Key) ("Updated to {0}" -f $mapping.NewValue)
+        }
+        $json = $configObject | ConvertTo-Json -Depth 10
+        Write-Utf8NoBomFile -Path $ConfigPath -Content ($json + [Environment]::NewLine)
+    } catch {
+        Add-Result "WARN" "Config path remapping" ("Could not update migrated config paths: {0}" -f $_.Exception.Message)
     }
 }
 
@@ -348,34 +446,54 @@ if ($legacyConfigPath -and (Split-Path -Leaf $legacyConfigPath) -eq "podcast_tra
 }
 
 $plannedTargets = New-Object 'System.Collections.Generic.List[object]'
-foreach ($path in @(
-    (Join-Path $resolvedProjectRoot "podcast_transcribe_config.json"),
-    (Join-Path $resolvedProjectRoot "preferred_terms.txt"),
-    (Join-Path $resolvedProjectRoot "preferred_replacements.json"),
-    (Join-Path $resolvedProjectRoot "speaker_reference_samples"),
-    (Join-Path $resolvedProjectRoot "pretrained_speaker_model"),
-    (Join-Path $resolvedProjectRoot "host_profile.json"),
-    (Join-Path $resolvedProjectRoot "_processed_files.json"),
-    (Join-Path $resolvedProjectRoot "output")
-)) {
-    $plannedTargets.Add([pscustomobject]@{ TargetPath = $path }) | Out-Null
-}
+$plannedTargets.Add([pscustomobject]@{ TargetPath = (Join-Path $resolvedProjectRoot "podcast_transcribe_config.json") }) | Out-Null
+$plannedTargets.Add([pscustomobject]@{ TargetPath = (Join-Path $resolvedProjectRoot "pretrained_speaker_model") }) | Out-Null
+$plannedTargets.Add([pscustomobject]@{ TargetPath = (Join-Path $resolvedProjectRoot "_processed_files.json") }) | Out-Null
+$plannedTargets.Add([pscustomobject]@{ TargetPath = (Join-Path $resolvedProjectRoot "output") }) | Out-Null
 
-$legacySourceDir = $null
-$targetSourceDir = $null
-if ($legacyConfig -and $legacyConfig.default_source_dir) {
-    $sourceResolution = Resolve-LegacySourceDirectory -LegacyConfig $legacyConfig -LegacyRoot $resolvedLegacyRoot -CurrentProjectRoot $resolvedProjectRoot
-    if ($sourceResolution.SourcePath) {
-        $legacySourceDir = $sourceResolution.SourcePath
-        $targetSourceDir = Join-Path $resolvedProjectRoot $sourceResolution.RelativePath
-        $plannedTargets.Add([pscustomobject]@{ TargetPath = $targetSourceDir }) | Out-Null
-        if ($sourceResolution.Resolution -eq "current_repo_relative_fallback") {
-            Add-Result "PASS" "Configured source directory resolution" ("Legacy source recovered by matching current-repo-relative path '{0}' inside the legacy directory." -f $sourceResolution.RelativePath.Replace('\', '/'))
-        }
-    } elseif ($sourceResolution.Resolution -eq "not_found") {
-        Add-Result "WARN" "Configured source directory" ("Configured source directory could not be resolved inside the legacy directory: {0}" -f $sourceResolution.ConfigValue)
+$configSpecs = @(
+    [pscustomobject]@{ Key = "default_source_dir"; Label = "Configured source directory"; Type = "Directory"; Default = "source"; CopyMode = "progress"; Optional = $true },
+    [pscustomobject]@{ Key = "preferred_terms_file"; Label = "Preferred terms"; Type = "File"; Default = "preferred_terms.txt"; CopyMode = "file"; Optional = $true },
+    [pscustomobject]@{ Key = "replacement_map_json"; Label = "Preferred replacements"; Type = "File"; Default = "preferred_replacements.json"; CopyMode = "file"; Optional = $true },
+    [pscustomobject]@{ Key = "known_speakers_dir"; Label = "Speaker reference samples"; Type = "Directory"; Default = "speaker_reference_samples"; CopyMode = "merge"; Optional = $true },
+    [pscustomobject]@{ Key = "corrections_dir"; Label = "Corrections directory"; Type = "Directory"; Default = ""; CopyMode = "merge"; Optional = $true },
+    [pscustomobject]@{ Key = "host_profile_json"; Label = "Host profile"; Type = "File"; Default = "host_profile.json"; CopyMode = "file"; Optional = $true }
+)
+
+$migrationPlans = New-Object System.Collections.Generic.List[object]
+$configPathMappings = New-Object System.Collections.Generic.List[object]
+
+foreach ($spec in $configSpecs) {
+    $configuredValue = Get-ConfigValueOrDefault -ConfigObject $legacyConfig -Key $spec.Key -DefaultValue $spec.Default
+    $resolved = Resolve-ConfiguredPath -ConfiguredPath $configuredValue -LegacyRoot $resolvedLegacyRoot -CurrentProjectRoot $resolvedProjectRoot -PathType $spec.Type
+    $targetPath = if (-not [string]::IsNullOrWhiteSpace($resolved.RelativePath)) {
+        Join-Path $resolvedProjectRoot $resolved.RelativePath
     } else {
-        Add-Result "WARN" "Configured source directory" ("Configured source is outside the legacy directory and will not be copied: {0}" -f $sourceResolution.ConfigValue)
+        $null
+    }
+
+    $plan = [pscustomobject]@{
+        Key        = $spec.Key
+        Label      = $spec.Label
+        Type       = $spec.Type
+        CopyMode   = $spec.CopyMode
+        Optional   = $spec.Optional
+        Configured = $configuredValue
+        Resolved   = $resolved
+        TargetPath = $targetPath
+    }
+    $migrationPlans.Add($plan) | Out-Null
+
+    if ($targetPath) {
+        $plannedTargets.Add([pscustomobject]@{ TargetPath = $targetPath }) | Out-Null
+    }
+
+    if ($resolved.ShouldRemap -and -not [string]::IsNullOrWhiteSpace($resolved.PortablePath)) {
+        $configPathMappings.Add([pscustomobject]@{
+            Key         = $spec.Key
+            NewValue    = $resolved.PortablePath
+            ShouldRemap = $true
+        }) | Out-Null
     }
 }
 
@@ -394,31 +512,47 @@ if ($legacyConfigPath -and (Split-Path -Leaf $legacyConfigPath) -eq "podcast_tra
     Add-Result "WARN" "Runtime config" "Legacy runtime config was not found."
 }
 
-Copy-FileWithBackup `
-    -SourcePath (Join-Path $resolvedLegacyRoot "preferred_terms.txt") `
-    -TargetPath (Join-Path $resolvedProjectRoot "preferred_terms.txt") `
-    -Label "Preferred terms"
-
-Copy-FileWithBackup `
-    -SourcePath (Join-Path $resolvedLegacyRoot "preferred_replacements.json") `
-    -TargetPath (Join-Path $resolvedProjectRoot "preferred_replacements.json") `
-    -Label "Preferred replacements"
-
-$legacySpeakerDir = Resolve-LegacyCandidate -LegacyRoot $resolvedLegacyRoot -Candidates @("speaker_reference_samples")
-if ($legacySpeakerDir) {
-    Copy-DirectoryMerge `
-        -SourcePath $legacySpeakerDir `
-        -TargetPath (Join-Path $resolvedProjectRoot "speaker_reference_samples") `
-        -Label "Speaker reference samples"
-
-    $legacySpeakersJson = Join-Path $legacySpeakerDir "speakers.json"
-    if (Test-Path -LiteralPath $legacySpeakersJson -PathType Leaf) {
-        Add-Result "PASS" "Speaker reference config" ("Included speakers.json from {0}" -f $legacySpeakerDir)
-    } else {
-        Add-Result "WARN" "Speaker reference config" ("speaker_reference_samples exists, but speakers.json was not found in {0}" -f $legacySpeakerDir)
+foreach ($plan in $migrationPlans) {
+    if (-not $plan.Resolved.LegacyPath) {
+        switch ($plan.Resolved.Resolution) {
+            "external_absolute" {
+                Add-Result "WARN" $plan.Label ("Configured path is outside the legacy directory and was not copied: {0}" -f $plan.Configured)
+            }
+            "relative_missing" {
+                if (-not [string]::IsNullOrWhiteSpace($plan.Configured)) {
+                    Add-Result "WARN" $plan.Label ("Configured path was not found under the legacy directory: {0}" -f $plan.Configured)
+                }
+            }
+            "current_repo_relative_only" {
+                Add-Result "WARN" $plan.Label ("Path was remapped to the new repo layout, but the matching legacy content was not found: {0}" -f $plan.Configured)
+            }
+        }
+        continue
     }
-} else {
-    Add-Result "WARN" "Speaker reference samples" "Legacy speaker_reference_samples directory was not found."
+
+    if ($plan.Resolved.Resolution -eq "current_repo_relative_fallback") {
+        Add-Result "PASS" ("{0} resolution" -f $plan.Label) ("Legacy content recovered by matching current-repo-relative path '{0}' inside the legacy directory." -f $plan.Resolved.RelativePath.Replace('\', '/'))
+    }
+
+    switch ($plan.CopyMode) {
+        "file" {
+            Copy-FileWithBackup -SourcePath $plan.Resolved.LegacyPath -TargetPath $plan.TargetPath -Label $plan.Label
+        }
+        "merge" {
+            Copy-DirectoryMerge -SourcePath $plan.Resolved.LegacyPath -TargetPath $plan.TargetPath -Label $plan.Label
+            if ($plan.Key -eq "known_speakers_dir") {
+                $legacySpeakersJson = Join-Path $plan.Resolved.LegacyPath "speakers.json"
+                if (Test-Path -LiteralPath $legacySpeakersJson -PathType Leaf) {
+                    Add-Result "PASS" "Speaker reference config" ("Included speakers.json from {0}" -f $plan.Resolved.LegacyPath)
+                } else {
+                    Add-Result "WARN" "Speaker reference config" ("Known speakers directory exists, but speakers.json was not found in {0}" -f $plan.Resolved.LegacyPath)
+                }
+            }
+        }
+        "progress" {
+            Copy-DirectoryWithProgress -SourcePath $plan.Resolved.LegacyPath -TargetPath $plan.TargetPath -Label $plan.Label
+        }
+    }
 }
 
 $legacyPretrainedDir = Resolve-LegacyCandidate -LegacyRoot $resolvedLegacyRoot -Candidates @(
@@ -436,11 +570,6 @@ if ($legacyPretrainedDir) {
 }
 
 Copy-FileWithBackup `
-    -SourcePath (Join-Path $resolvedLegacyRoot "host_profile.json") `
-    -TargetPath (Join-Path $resolvedProjectRoot "host_profile.json") `
-    -Label "Host profile"
-
-Copy-FileWithBackup `
     -SourcePath (Join-Path $resolvedLegacyRoot "_processed_files.json") `
     -TargetPath (Join-Path $resolvedProjectRoot "_processed_files.json") `
     -Label "Processed-files state"
@@ -455,30 +584,7 @@ if ($legacyOutputDir) {
     Add-Result "WARN" "Output directory contents" "Legacy output directory was not found."
 }
 
-if ($legacySourceDir -and $targetSourceDir -and (Test-Path -LiteralPath $legacySourceDir -PathType Container)) {
-    Copy-DirectoryWithProgress `
-        -SourcePath $legacySourceDir `
-        -TargetPath $targetSourceDir `
-        -Label "Configured source directory"
-
-    $targetConfigPath = Join-Path $resolvedProjectRoot "podcast_transcribe_config.json"
-    if (Test-Path -LiteralPath $targetConfigPath -PathType Leaf) {
-        try {
-            $targetConfig = Get-Content -LiteralPath $targetConfigPath -Raw | ConvertFrom-Json
-            $relativeTargetSource = Convert-ToProjectRelativePath -Path $targetSourceDir -BasePath $resolvedProjectRoot
-            $portableSource = $relativeTargetSource.Replace('\', '/')
-            if ($null -eq $targetConfig.PSObject.Properties["default_source_dir"]) {
-                $targetConfig | Add-Member -NotePropertyName "default_source_dir" -NotePropertyValue $portableSource
-            } else {
-                $targetConfig.default_source_dir = $portableSource
-            }
-            $targetConfig | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $targetConfigPath -Encoding UTF8
-            Add-Result "PASS" "Updated runtime config source directory" ("default_source_dir now points to {0}" -f $portableSource)
-        } catch {
-            Add-Result "WARN" "Updated runtime config source directory" ("Could not update migrated config source path: {0}" -f $_.Exception.Message)
-        }
-    }
-}
+Update-MigratedConfigPaths -ConfigPath (Join-Path $resolvedProjectRoot "podcast_transcribe_config.json") -PathMappings $configPathMappings
 
 Write-ResultSummary
 Read-Host "Press Enter to continue"

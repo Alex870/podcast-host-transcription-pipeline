@@ -324,9 +324,9 @@ If you already have an older working directory with transcripts, speaker samples
 .\Run Podcast Transcribe.ps1
 ```
 
-Choose `3` to launch the migration assistant. It opens a folder picker for the legacy directory, warns once if existing target files or folders will be overwritten or merged into, and then copies forward the runtime config, glossary files, speaker-reference material, processed-file state, host profile, pretrained speaker model directory, and output contents while printing a pass/warn checklist for anything it could not find.
+Choose `3` to launch the migration assistant. It opens a folder picker for the legacy directory, warns once if existing target files or folders will be overwritten or merged into, and then copies forward the runtime config, glossary files, speaker-reference material, processed-file state, host profile, pretrained speaker model directory, optional corrections directory, and output contents while printing a pass/warn checklist for anything it could not find.
 
-If the legacy `default_source_dir` points to a folder inside the selected legacy directory, the migration assistant also copies that source tree into the new repository at the same relative path and updates the migrated config so `default_source_dir` points at the copied location.
+If the legacy config points repo-local absolute paths back into the old repository tree, the migration assistant now rewrites those entries to portable repo-relative paths in the migrated `podcast_transcribe_config.json`. That includes `default_source_dir` and the configured glossary, speaker-reference, corrections, and host-profile paths when they live inside the legacy repo. If `default_source_dir` or another configured repo-local directory exists inside the selected legacy directory, the assistant copies it into the new repository at the same relative path before updating the config.
 
 Use them like this:
 
